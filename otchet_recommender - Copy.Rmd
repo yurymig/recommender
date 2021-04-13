@@ -1,0 +1,924 @@
+---
+title: "Рекомендательная система"
+author: "Команда 15: Горохова Анастасия, Чечёткин Макар, Писковский Роман, Мигунов Юрий, Гильмутдинова Алина"
+output: rmarkdown::github_document
+    
+---
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  error = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r, include=FALSE}
+library(tnet)
+library(tidytext)
+library(stopwords)
+library(tidyverse)
+library(ggplot2)
+library(igraph)
+library(knitr)
+library(dplyr)
+library(stringr)
+library(recommenderlab)
+library(haven)
+library(kableExtra)
+library(sjPlot)
+library(tidyr)
+library(car)
+library(MASS)
+library(e1071)
+source("~/shared/minor2_2019/2-tm-net/project/extract_json.R") 
+load("~/shared/minor2_2019_15/data15.rda")
+movieUpd6 <- read_csv("~/shared/minor2_2019_15/movieUpd6.csv")
+movies15 <- read_csv("~/shared/minor2_2019_15/movies15.csv")
+overview_cosine <- read_csv("~/shared/minor2_2019_15/overview_cosine.csv")
+```
+
+# Начало работы
+
+
+**Цель проекта: создать систему, способную рекомендовать фильмы:**
+
++  На основе преференций
++  На основе ранее понравившихся фильмов
+
+
+**Входные данные:** 
+
+Два датасета: один из них содержит всебе данные о фильме: язык, студия, каст, etc; второй датасет содержит в себе оценки фильмов пользователями.
+
+
+**Наш план работы выглядел таким образом:**
+
+0. Анализ других рекомендательных систем
+1. Описание данных
+2. Эксплораторный анализ данных, выбор переменных, на основе которого будут создаваться системы
+3. Создание рекомендательных систем и их проверка
+4. Оценка полученных рекомундаций
+5. Создание симулятивной модели
+6. Сбор всей работы в общий отчет.
+
+
+
+# Описание данных
+
+Перед непосредственным анализом, данные необходимо почистить и добавить новые, если необходимо.
+
+Помимо дефолтных датасетов, мы решили добавить еще информацию о **возрастных ограничениях** фильмов. Для этого мы использовали два датасета, взятых с habr.com
+Также мы разбили длительность фильма на три промежутке – это понадобится для дальнейшего анализа
+
+
+```{r eval=FALSE, include=FALSE}
+c = select(IMDb, Title, Rated)
+p = select(filmMPAAratings, Film, MPAA_Rating)
+movie1512 = left_join(movie1512, p, by = c("title" = "Film"))
+movie1512 = left_join(movie1512, c, by = c("title" = "Title"))
+movie1512$MPAA_Rating =  ifelse(is.na(movie1512$MPAA_Rating), movie1512$Rated, movie1512$MPAA_Rating)
+library(DataExplorer)
+movie1512  = drop_columns(movie1512, "Rated")
+movie1512 = mutate(movie1512, interval_duration = runtime)
+
+movie1512$interval_duration = ifelse(movie1512$interval_duration<=90, "<=90", ifelse(movie1512$interval_duration>90&movie1512$interval_duration<=120, "<=120", ">120"))
+ 
+movie1512$MPAA_Rating = str_replace_all(movie1512$MPAA_Rating, 'N/A', "NOT RATED")
+movie1512$popularity = as.character(movie1512$popularity)
+movie1512$vote_average = as.character(movie1512$vote_average)
+movie1512$MPAA_Rating = set_missing(movie1512$MPAA_Rating, ?NOT RATED?)
+movie1512$MPAA_Rating[is.na(movie1512$MPAA_Rating)] <- "NOT RATED")
+
+write.csv(movie1512, '~/movies15.csv')
+```
+
+Далее, мы удалили N/A значения, а также удалили ненужные переменный. В итоговом проекта нами были использованы следующие переменные:
+
+```{r}
+Variable_Name = c('genres', 'title', 'MPAA_rating', 'interval_duration', "Rating")
+
+Description = c('genre of a film', 'title of a filmt', 'rating of a film', 'duration of a film', "Rating ofa film")
+
+Variable_Type = c('Character', 'Character', 'Nominal', 'Interval', "Ratio")
+
+data_description <- data.frame(Variable_Name, Description, Variable_Type, stringsAsFactors = FALSE)
+```
+
+```{r}
+kable(data_description) %>% 
+  kable_styling(bootstrap_options = c('bordered'), full_width = FALSE)
+```
+
+
+# Эксплораторный анализ
+
+
+**Эксплораторный анализ**  позволяет нам сделать brief overview полученной даты, выявить паттерны и зависимости, которые помогут в создании точной рекомендательной системы.
+
+Кроме того,  у нас есть несколько гипотез, которые поможет проверить эксплораторный анализ:
+
+1. Существует связь между разными категориями переменных, что может влиять на точность рекомендательной системы (Например, при указании нескольких жанров авторами фильма)
+2. Мы также предполагаем, что другие переменные (например, страна или жанр) могут повлиять на рейтинг. Причем, степени влияния отдельных переменных и переменных в совокупности могут разниться
+3. В то же время, сеть по фильмам будет четко кластеризоваться и модулярность будет высокой – такую переменную можно смело включать в нашу content-based систему.
+
+эксплораторный анализ был проведен тремя методами:
+
+1. Сетевой анализ
+2. Регрессионный анализ
+3. Текстовый анализ
+
+## Сетевой анализ
+
+Первый этап отбора данных для content-based системы – сетевой анализ. Он позволит узнать, есть ли связь между категориями.
+Читабельные сети могут быть построены только по категориальным данным. Просмотрев рекомендательные системы на крупных сайтах и проанализировав наш датасет, мы пришли к выводу, что обязательно нужно проверить страны и жанры, так как они присутствовали в большинстве рекомендательных систем.
+Напомним, что мы будем смотреть на четкость получившихся кластеров и модулярность (чем выше модулярность и четче кластеры – тем лучше для нашей рекомендательной системы)
+
+Начнем с *жанра*
+
+Сначала рассмотрим, как связаны сами жанры между собой. Напоминаем, что наша гипотеза заключается в том, что если категории перменной тесно связаны между собой, то система не будет 100% точной. Почему? Например, если человек ищет фильм в жанре "Драма", то может случиться такое, что ему выпадет фильм, где вторым жанром указана "Комедия"
+
+Строим сеть по жанрам, где вершинами будут *жанры*, а связями - *фильмы*. Размер вершин задается *degree*
+```{r, fig.height=30, fig.width=40}
+movies_net = movies99
+movies_net$genres = str_replace_all(movies_net$genres, fixed("'"), '"')
+
+data = extract_json2(df = movies_net, col = "genres")
+data1 = extract_json2(df = movies_net, col = "genres")
+
+data = data %>% dplyr::select(id, title, genres_sep)
+data1 = data1 %>% dplyr::select(id, title, genres_sep)
+
+df = full_join(data, data1, by = "id")
+
+df = df %>% dplyr::select(genres_sep.x, genres_sep.y)
+
+genres = graph_from_data_frame(df, directed = F)
+genres = igraph::simplify(genres, remove.multiple = T)
+
+fgcommune <- fastgreedy.community(genres)
+plot(fgcommune, genres, edge.color = "black", vertex.label.cex = 1.4, vertex.size = degree(genres), edge.width = 1, layout = layout.davidson.harel)
+
+
+```
+Мы видим, что сеть разбилась на три кластера, причем, эти кластеры перекрывают друг друга, что говорит о довольно тесных связях между вершинами. Сложно предположить, по какому признаку произошла кластеризация, ведь в одном кластере есть как вершины с большим количеством связи, так и с маленьким (взгляните на синий кластер)
+
+Это наводит на мысль о неточной кластеризации. Посчитаем *модулярность*.
+```{r}
+modularity(fgcommune)
+```
+
+модулярность очень низкая, что говорит о не очень высокой точности кластеризации. Таким образом, фильмы хоть и тесно связаны между собой, не имеют достаточной логики для кластеризации, то есть, выбирать несколько жанров для более точной рекомендации нет особого смысла
+
+Но есть ли смысл вообще брать жанры как переменную для рекомендации?
+
+Построим кластерную карту фильмов, где вершины будут фильмами, а связи - жанрами.
+
+```{r}
+
+netdata = movies99 %>% dplyr::select(id, genres)
+netdata$genres = str_replace_all(netdata$genres, fixed("'"), '"')
+netdata = extract_json2(df = netdata, col = "genres")
+netdata = netdata %>% spread(key = genres_sep, value = genres_v, fill = 0)
+rownames(netdata) = netdata$id
+netdata = netdata %>%
+  dplyr::select(-id, -genres) %>% 
+  as.matrix()
+
+graph = graph_from_incidence_matrix(netdata)
+
+
+graphpro = bipartite.projection(graph) 
+
+graphp = graphpro[[1]]
+
+V(graphp)$label = NA
+
+lt = layout.fruchterman.reingold(graphp)
+
+id = rownames(netdata)
+
+data = data.frame(mov = str_replace(id, "id", ""), i = 1:473)
+
+graphp = projecting_tm(netdata, method="Newman")
+
+graphp = left_join(graphp, data, by = "i")
+
+df = data.frame(mov1 = str_replace(id, "id_", ""), j = 1:473)
+
+graphp = left_join(graphp, df, by = "j")
+
+graphp = dplyr::select(graphp, i = mov, j = mov1, w)
+
+graphp1 = filter(graphp, w >= 0.03) %>% dplyr::select(-w) 
+
+set.seed(211)
+
+net1 = igraph::simplify(graph_from_edgelist(as.matrix(graphp1), directed=F))
+
+V(net1)$color <- "red"
+
+V(net1)$label <- NA
+
+membership = membership(fastgreedy.community(net1))
+
+plot(net1, layout = layout.kamada.kawai(net1), edge.arrow.size = 0, vertex.color = membership, vertex.size = 5,vertex.label.cex = 0.4, margin = -0.1)
+```
+
+Выделилось довольно много кластеров, визуально почти все они имеют довольно четкие границы. Посмотрим на *модулярность*
+
+```{r}
+membership = fastgreedy.community(net1)
+modularity(membership)
+```
+
+В целом, значение намного выше, нежели в случае, когда связями были фильмы, а а вершинами – жанры.
+К тому же, жанры – один из самых гланых критериев при выборе фильма, поэтому мы оставляем жанры как критерий для нашей будущей content-based системы.
+
+Очень часто в рекомендательных системах используют *страны*. Давайте проверим, выделяются ли кластеры по странам. Как и с жанрами, сначала построим кластерную карту, где вершины будут странами, а связи – фильмами.
+
+```{r, fig.height=30, fig.width=40}
+movies_net1 = movies99
+movies_net1$production_countries = str_replace_all(movies_net1$production_countries, fixed("'"), '"')
+
+data11 = extract_json2(df = movies_net1, col = "production_countries")
+data111 = extract_json2(df = movies_net1, col = "production_countries")
+
+data11 = data11 %>% dplyr::select(id, title, production_countries_sep)
+data111 = data111 %>% dplyr::select(id, title, production_countries_sep)
+
+df1 = full_join(data11, data111, by = "id")
+
+df1 = df1 %>% dplyr::select(production_countries_sep.x, production_countries_sep.y)
+
+country = graph_from_data_frame(df1, directed = F)
+country = igraph::simplify(country, remove.multiple = T)
+
+fgcommune1 <- fastgreedy.community(country)
+plot(fgcommune1, country, edge.color = "black", vertex.label.cex = 0.5, vertex.size = degree(country)/10, edge.width = 0.4, layout = layout.davidson.harel)
+```
+
+```{r, fig.height=15, fig.width=20}
+modularity(fgcommune1)
+```
+
+Ситуация та же, что и с жанрами. Низкая модулярность и очень кластеры, которые накладываются друг на друга. Связь есть, и довольно сильная, но сама кластеризация доверия не вызывает. Построим сеть по фильмам, где страны станут связями:
+
+```{r, fig.height=30, fig.width=50}
+
+netdata1 = movies99 %>% dplyr::select(id, production_countries)
+netdata1$production_countries = str_replace_all(netdata1$production_countries, fixed("'"), '"')
+netdata1 = extract_json2(df = netdata1, col = "production_countries")
+netdata1 = netdata1 %>% spread(key = production_countries_sep, value = production_countries_v, fill = 0)
+rownames(netdata1) = netdata1$id
+netdata1 = netdata1 %>%
+  dplyr::select(-id, -production_countries) %>% 
+  as.matrix()
+
+graph_c = graph_from_incidence_matrix(netdata1)
+
+
+graphpro1 = bipartite.projection(graph_c) 
+
+graphp_c = graphpro1[[1]]
+
+V(graphp_c)$label = NA
+
+lt = layout.fruchterman.reingold(graphp_c)
+
+id = rownames(netdata1)
+
+data_c = data.frame(mov = str_replace(id, "id", ""), i = 1:472)
+
+graphp_c = projecting_tm(netdata1, method="Newman")
+
+graphp_c = left_join(graphp_c, data_c, by = "i")
+
+df_c = data.frame(mov1 = str_replace(id, "id_", ""), j = 1:472)
+
+graphp_c = left_join(graphp_c, df_c, by = "j")
+
+graphp_c = dplyr::select(graphp_c, i = mov, j = mov1, w)
+
+graphp_c1 = dplyr::filter(graphp_c, w >= 0.03) %>% dplyr::select(-w) 
+
+set.seed(211)
+
+net_c = igraph::simplify(graph_from_edgelist(as.matrix(graphp_c1), directed=F))
+
+V(net_c)$color <- "red"
+
+V(net_c)$label <- NA
+
+
+membership1 = membership(fastgreedy.community(net_c))
+
+plot(net_c, layout = layout.kamada.kawai(net_c), edge.arrow.size = 0, vertex.color = membership1, vertex.size = 5,vertex.label.cex = 0.4, margin = -0.1)
+
+```
+ В целом, кластеры довольно четкие, это значит, что переменная нам подходит. Посмотрим на *модулярность*
+
+```{r}
+fgcommunec <- fastgreedy.community(net_c)
+modularity(fgcommunec)
+```
+Довольно высокое значение – разделение можно доверять
+
+По результатам сетевого анализа и страны, и жанры подходят как переменные. Также в ходе анализа подтвердились гипотезы №1 (кластерные карты по жанрам и по картам показали, что есть связи существуют, к тому же, можно выделить паттерны и посмотреть, какие комбинации жанров используются чаще всего и какие страны чаще сотрудничают друг с другом) и №3 (как мы и ожидали, сети по фильмам в обоих случаях разбились на четкие кластеры, это значит, что рекомендация по похожим признакам будет релевантна в случае с жанрами и странами)
+
+## Регрессионный Анализ
+
+Мы предположили, что если переменная влияет на рейтинг, то, значит, люди обращают внимание на нее при выборе фильма, а это значит, что переменную можно включить в content-based систему.
+Чтобы определить, влияют ли выбранные нами переменные на рейтинг, проведем статистические тесты (данные заранее почищены и приведены к нужному формату, все условия )
+
+```{r}
+# Выбираем переменные
+df_reg <- movieUpd6 %>% dplyr::select(genres, production_companies, 
+               production_countries, MPAA_Rating, popularity, 
+               average, vote_average, runtime)
+
+# Подготавливаем переменные
+df_reg <- df_reg %>% unnest_tokens(countries, production_countries)
+df_reg <- df_reg %>% filter(str_length(countries) == 2) %>% filter(countries != "of")
+df_reg$countries <- toupper(df_reg$countries)
+
+# Приводим нужному типу
+df_reg$genres <- as.factor(df_reg$genres)
+df_reg$production_companies <- as.factor(df_reg$production_companies)
+df_reg$countries <- as.factor(df_reg$countries)
+df_reg$MPAA_Rating <- as.factor(df_reg$MPAA_Rating)
+df_reg$popularity <- as.numeric(df_reg$popularity)
+df_reg$average <- as.numeric(df_reg$average)
+df_reg$vote_average <- as.numeric(df_reg$vote_average)
+df_reg$runtime <- as.numeric(df_reg$runtime)
+
+```
+
+Перед построением регрессий проверим, все ли данные подходят. Для этого проведем статистические тесты и посмотрим, все ли переменные статистически значимы (хуйня, переписать)
+```{r}
+chisq.test(df_reg$vote_average, df_reg$genres )
+chisq.test(df_reg$vote_average, df_reg$countries)
+chisq.test(df_reg$vote_average, df_reg$MPAA_Rating)
+cor.test(df_reg$vote_average, df_reg$runtime, method = "spearman")
+cor.test(df_reg$vote_average, df_reg$popularity, method = "spearman")
+```
+
+По результатам тестов нам не подходят только страны (они практически не влияют на рейтинг)
+
+Но мы предположили, что в совокупности эти переменные влияют на рейтинг по-разному.
+Для того, чтобы проверить это и выбрать наилучшую модель, мы построим 4 регрессии:
+1. С длительностью (т.к. это числовая переменная и имеет высокий коэффициент корреляции с рейтингом)
+2. Сдлительностью и жанром
+3. С длительностью, жанром и возратсным рейтингом
+4. С длительностью, жанром, возратсным рейтингом м популрностью)
+```{r include=FALSE}
+
+m1 <- lm(vote_average ~ runtime, data = df_reg)
+tab_model(m1)
+
+m2  <- lm(vote_average ~ runtime + genres, data = df_reg)
+tab_model(m2)
+
+m3 <- lm(vote_average ~ runtime + genres + MPAA_Rating, data = df_reg)
+tab_model(m3)
+
+m4 <- lm(vote_average ~ runtime + genres + MPAA_Rating + popularity, data = df_reg)
+tab_model(m4)
+
+```
+Чтобы понять, какая из моделей точнее, мы проводем ANOVA тест, который позволит нам сравнить модели. 
+
+Но перед тестом  необходимо проверить все требования (провести *диагностику* моделей), чтобы быть уверенными в точности нашего теста.
+
+**Требование 1: Мультиколлинеарность**
+
+```{r}
+
+vif(m2) 
+vif(m3) 
+vif(m4) 
+```
+Во всех случаях  показатель GVIF менее 10, значит требование выполняется
+
+**Требование 2: Аутлаеры**
+```{r}
+
+outlierTest(m1)
+
+df_reg <- df_reg[-c(638, 663), ]
+
+m2 <- lm(vote_average ~ runtime + genres, data = df_reg)
+m3 <- lm(vote_average ~ runtime + genres + MPAA_Rating, data = df_reg)
+m4 <- lm(vote_average ~ runtime + genres + MPAA_Rating + popularity, data = df_reg)
+```
+В нашем случае выявились два аутлаера. Мы удалили их.
+
+**Требование 3: Studentized residuals **
+```{r}
+
+
+
+sresid <- studres(m2) 
+hist(sresid, freq = FALSE, 
+     main = "Distribution of Studentized Residuals")
+
+sresid <- studres(m3) 
+hist(sresid, freq = FALSE, 
+     main = "Distribution of Studentized Residuals")
+
+
+sresid <- studres(m4) 
+hist(sresid, freq = FALSE, 
+     main = "Distribution of Studentized Residuals")
+
+```
+
+Распределение близко к нормальному. Учитывая, что в реальном мире практически нет нормально распределенных данных, нас устроит и так.
+
+**Требование 4: heteroscedasticity**
+```{r}
+ncvTest(m2) 
+```
+P-value is significant. Это плохо, попробуем исправить путем трансформации респонса.
+
+```{r include=FALSE}
+# Исправляем за счет трансформации респонс:
+df2_reg <- caret::BoxCoxTrans(df_reg$vote_average)
+print(df2_reg)
+df_reg$vote_average2 <- predict(df2_reg, df_reg$vote_average)
+hist(df_reg$vote_average)
+hist(df_reg$vote_average2)
+```
+После изменений снова проверяем:
+```{r}
+
+m11 <- lm(vote_average2 ~ runtime, data = df_reg)
+ncvTest(m11)
+
+```
+Стало получше, но p-value все еще значимое. Плохо. Тем не менее, 3 из 4 требований выполнены, потому тест сделать можно, просто во время интерпретации результатов помнить о том, что модели не очень точны
+
+**ANOVA Тест**
+
+Сравниваем модели с помощью ANOVA теста:
+```{r}
+ 
+anova(m2, m3, m4)
+
+```
+Судя по ANOVA, наиболее точной является модель 2 (длительность, жанр, возрастной рейтинг), так как у нее меньше F-статистика и больше степеней свободы.
+ПО анове в принципе сложно выбрать лучшую модель, так как здес работает принцип "Чем больше предикторов – тем лучше". Судя по F-статистике, наши модели не имеют тенденции к улучшению, а модель 1 выбирать нецелесообразно, так как слишком мало предикторов, потому вторая модель выглядит наиболее подходящей.
+
+**Вывод**
+
+Основываясь на проведенном анализе, для content-based системы мы возьмем:
+
+1. *Жанры* – они релевантны и с точки зрения анализа, и с точки зрения "жизни". Жанр – основной критерий выбора фильмов
+2. *MPAA рейтинг* – то же самое. Во-первых, очень часто возрастной рейтинг встречался в других рексистемах. Во-вторых, по рейтингу можно выбрать фильм под настроение или под компанию (хочешь боевик с насилием – ставь высокий рейтинг, хочешь фильм про любовь, дружбу и пони – ставь низкий рейтинг)
+3. *Длительность фильма* – анализ доказал, что эта переменная релевантна. Также в других рексистемах пользователю предлагают выбрать длительность фильма. Мы считаем, что длительность – важный критерий, ведь не всегда людям хочется сидеть за фильмом долго.
+
+Хоть сетевой анализ и показал, что *страны* могут быть релевантным критерием для системы, стат тест показал обратное. К тому же, мы столнулись с проблемами,  связанными с форматом данных: в фильмах указано несколько стран, что существенно снижает точность системы (как и в *жанрах*, но они, по нашему мнению, намного полезнее для рекомендательной системы). Потому страны мы не берем в качестве критерия для content-based системы.
+
+К тому же, регрессионный анализ подтвердил нашу гипотезу №2: переменные действительно влияют на рейтинг как поотдельности, так и в совокупности (причем, влияние на рейтинг разное для разных комбинаций переменных)
+
+
+## Текстовый анализ
+
+В наших планах – создание рекомендательной системы на основе схожести описаний. Такая система решила бы проблему холодного старта, ведь новый пользователь, который не имеет каких-то особых предпочтений, может ввести название любого понравившегося ранее фильма, и система выдаст список фильмов с похожим описанием.
+
+Для того, чтобы воплотить нашу идею, необходимо провести текстовый анализ. Он покажет, насколько идея рекомендации фильмов по описанию релевантна, а также станет основой для нее.
+
+Разобъем описание фильма (overview) на отдельные слова и удалим из них стоп-слова. В данном случае мы используем английский словарь стоп-слов. 
+Посмотрим на топ-7 по частоте использования слов.
+```{r}
+movies_text=movies99 %>% dplyr::select(id,overview)
+movies_long=movies_text %>% unnest_tokens(words,overview)
+stopwords=data.frame(words=stopwords("en"),stringsAsFactors=FALSE)
+movies_long=movies_long %>% anti_join(stopwords)
+movies_long %>% group_by(words) %>% summarise(Count=n()) %>% arrange(-Count) %>% head(7) %>% knitr::kable()
+```
+
+Далее, для того, чтобы предлагать фильмы на основе их описания, надо создать матрицу смежности. Также, чтобы система выдавала нам максимально схожие фильмы(а не те же фильмы, что вводим мы), заменим диагональные элементы с 1 на 0.
+
+Посмотрим на матрицу смежности фильмов на разных отрезках. Как мы видим, уровень схожести заходит до 28%, поэтому можно использовать описания.
+
+```{r}
+count_words=movies_long %>% count(words) %>% filter(!str_detect(words,"[0-9]"))
+words_spread=movies_long %>% count(id,words) %>% bind_tf_idf(words,id,n) %>% dplyr::select(id, words, tf_idf) %>%
+    spread(words, tf_idf, fill = 0)
+rownames(words_spread)=words_spread$id
+words_spread=words_spread %>% dplyr::select(-id) %>% as.matrix()
+words_spread=lsa::cosine(words_spread %>% t())
+diag(words_spread)=0
+a <- max(overview_cosine[1:50,1:50])
+b <- max(overview_cosine[50:100,50:100])
+c <- max(overview_cosine[100:150,100:150])
+d <- max(overview_cosine[150:200,200:250])
+e <- max(overview_cosine[250:300,250:300])
+f <- max(overview_cosine[300:350,300:350])
+g <- max(overview_cosine[400:450,400:450])
+h <- c(a,b,c,d,e,f,g)
+h
+
+```
+
+
+
+# Рекомендательные системы
+
+## Content-Based система
+
+Content-based система исопльзуется в том случае, если у пользвателя, отсутствующего в системе *есть предпочтения* в выборе фильма. Предоставляется возможность указать предпочтения в *жанре*, *длительности* и *возрастном рейтинге*. 
+
+- **Жанр** мы считаем основополагающей характеристикой фильма, а любимые жанры у каждого пользователя разные, поэтому мы даем его указать.
+- **Продолжительность фильма** было решено выбрать всвязи с тем, что на этапе эксплароторного анализа было выявлено, что фильмы продолжительностью около полутора часов имеют более высокий рейтинг, а в нашей системе происходит ранжирвоание в том числе и по рейтингу. Не давая выбор продолжительности, вероятно, рекомендация предлагала бы только фильмы длины около полутора часов.
+- **Возрастной рейтинг** мы выбрали исходя из логический соображений о том, как пользвоатели могут выбирать фильмы. Например, человек желает посмотреть фильм с семьей, где есть маленькие дети, а значит он не хочет получить рекомендацию где были бы фильмы 18+, поэтому мы решили дать возоможность выбирать возрастное ограничение.
+
+Кроме того, если пользователь не определилися, либо просто безразличен к какому-либо пункту для заполнения, он может ничего не вписывать - рекомендация будет выдана на основе *заполненных пунктов*, а пустые проигнорируются.
+(Примечание: несмотря на то, что страны были выявлены как хорошая перменная для включения в систему, их использование сильно сокаращало итоговую выдачу в количестве фильмов. В комбинации с более приоритетными характеристикам, которые мы выбрали, в лучшем случае находилось 1-2 фильма. С большим датасетом этой проблемы бы не возникло, а страны имело бы смысл включить в фильтр.)
+---
+```{r}
+# отбираем данные по возрастным ограничениям для дальнейшего их ввода в рекомендательную систему
+MPA = movies15
+MPA = dplyr::select(MPA, id, MPAA_Rating)
+MPA = MPA %>% rename(movieId = id)
+MPA <- na.omit(MPA)
+```
+
+```{r}
+# включаем возрастной рейтинг в общий датасет
+based = movies99
+based = based %>% rename(movieId = id)
+based1 = left_join(based, MPA, by = "movieId")
+based1 <- based1[!duplicated(based1$movieId), ]
+
+#соединяем датасеты 
+ra = ratings99 %>% group_by(movieId) %>% summarize(rating = mean(rating, na.rm = T))
+based1 = inner_join(ra, based1)
+
+# заменяем кавычки для работы json
+based1$genres = str_replace_all(based1$genres, fixed("'"), '"')
+
+# преобразуем строки в отдельные жанры
+based1 = extract_json2(df = based1, col = "genres")
+
+based1 = based1 %>% spread(key = genres_sep, value = genres_v, fill = 0)
+
+# делаем интервальную длительность 
+based1$interval_duration <- ifelse(based1$runtime>120, ">120", ifelse(based1$runtime<=120 & based1$runtime>90, "<=120", "<90"))
+based1 <- based1[complete.cases(based1[ , 26]), ]
+
+#отбираем перменные для дальнейшего использования в рекомендации
+based2 = based1 %>% dplyr::select(movieId, rating, genres, interval_duration, MPAA_Rating)
+
+#убираем лишние перменные для составления матрицы
+based3 = based2 %>% dplyr::select(-interval_duration, -MPAA_Rating, -genres, -rating)
+
+#матрица схожести
+based3 = filter(distinct(based3))
+rownames(based3) = based3$movieId
+based3 = based3 %>% dplyr::select(-movieId)
+
+simbas = lsa::cosine(t(as.matrix(based3)))
+
+#заменяем единицы в матрице
+diag(simbas) = 0
+
+```
+
+```{r}
+#функция рекомендательной системы
+
+rec_content = function(genre, duration, ages, number = 5) {
+  
+  movie = based1
+  movieId = movie$movieId
+  
+if (length(movieId) > 0){
+  
+  similar = head(sort(simbas[,as.character(movieId)], decreasing = T), n = number)
+s = which(simbas[,as.character(movieId)] %in% similar, arr.ind = TRUE)
+row = s %% dim(simbas)[1]
+final = rownames(simbas)[row]
+p <- based1 %>% filter(movieId %in% final) %>% dplyr::filter(str_detect(genres, genre)) %>% filter(str_detect(interval_duration, duration)) %>% filter(str_detect(MPAA_Rating, ages)) %>%  dplyr::select(title) %>% head(number, title)
+rate = dplyr::select(based1, title, rating)
+z = left_join(p, rate, by = "title")
+z1 <- arrange(z, desc(rating))
+z1
+} else {
+"Фильм соответствующий введенным данным отсутствует в базе"
+
+}
+  
+}
+
+```
+
+
+```{r}
+##тест рекомендации
+
+rec_content("Action", "<=120", "R")
+
+```
+
+## Коллаборативная система
+
+Данная система используется, если пользователь уже в системе и оценил некоторое количество фильмов.
+
+Мы спрашиваем у пользователя его id и желаемое количество фильмов, после чего реализуем коллаборативную систему по методу "IBCF", так как данный метод направлен на схожесть элементов, а не пользователей, что является более точным подходом в данной ситуации. Кроме того, мы убрали фильмы с маленьким количеством оценок и пользователей, оценивших маленькое количество фильмов.
+При этом, если пользователь вводит айди, которого нет в базе данных, то он получит аутпут "Ваш профиль не найден в системе".
+
+Для начала создадим нового рандомного пользователя, чтобы реализовать систему на нем. Для этого определим соотношение оценок в исходном датасете, чтобы с таким же соотношением расставить оценки фильмов рандомному пользователю.
+
+```{r}
+weigth_rate=ratings99 %>% group_by(rating) %>% summarise(ves=round(n()/length(ratings99$rating),2)) %>% arrange(rating)
+plot(weigth_rate)
+```
+
+Создаем датафрейм с рейтингами пользователя, полученными рандомом. Соединяем его с общим датафреймом рейтингов. Посмотрим, какие фильмы оценил *рандомный пользователь* и какие оценки он им поставил(он оценил от 5 до 20 фильмов, но мы выведем его топ-5)
+
+```{r}
+data_movies=movies99 
+ind_rand=sample(1:nrow(data_movies),size = sample(5:20,1))
+user_films=data_movies$id[ind_rand]
+user_rating=sample(seq(0.5,5,0.5),size = length(user_films),replace = TRUE,prob = weigth_rate$ves)
+
+user_data=data_frame(userId=15015015,movieId=user_films,rating=user_rating)
+all_rating= ratings99 %>% dplyr::select(-timestamp) %>% rbind(user_data)
+all_rating %>% filter(userId=="15015015") %>% dplyr::select(-userId) %>% arrange(-rating) %>% head(5) %>%  knitr::kable()
+```
+
+
+
+
+```{r}
+collab=function(userid,x){
+  if(userid %in% unique(data_ratings$userId)){
+    data_ratings=select(ratings99, -timestamp)
+    ratings_spread=spread(data_ratings, key = movieId, value = rating)
+    rownames(ratings_spread)=ratings_spread$userId
+    ratings_spread=ratings_spread %>% select(-userId)
+    ratings_matrix=ratings_spread %>% as.matrix() %>% as("realRatingMatrix")
+    ratings_matrix=ratings_matrix[rowCounts(ratings_matrix) >= 10, colCounts(ratings_matrix) >5]
+    train=ratings_matrix[-match(userid,rownames(ratings_matrix)),]
+    user=ratings_matrix[match(userid,rownames(ratings_matrix)),]
+    model=Recommender(data=train,method="IBCF")
+    model_predict=predict(object = model,newdata=user,n=x)
+    id_predicted=model_predict@itemLabels[model_predict@items[[as.character(userid)]]]
+    user_predict_films=data_movies$original_title[match(id_predicted,data_movies$id)]
+    user_predict_ratings=model_predict@ratings[[as.character(userid)]]
+    output=data_frame(films=user_predict_films,predicted_rating=user_predict_ratings)
+    return(output)
+    print(output)
+    
+  }
+  else{
+    print("Ваш профиль не найден в системе.")
+  }
+}
+```
+
+## Система, основанная на overview
+
+Система рекомендация по Overview используется в том случае, если у пользователя *нет предпочтений* для желаемого к просмотру филмьа, из тех, которые предлагает выбрать Content Based система, но он хотел бы посмотреть что-то похожее на свой *любимый фильм*.
+
+Пользователь может ввести свой *любимый фильм* и получить рекоммендацию на основе схожести описаний. Как и в Content-Based системе ему будут предложены 5 фильмов проранжированные по рейтингу.
+
+
+```{r}
+##преобразуем матрицу смежности по овервью
+movieId <- movies99$id
+movieId <- sort(movieId)
+rownames(overview_cosine) <- movieId
+overview_cosine <- as.matrix(overview_cosine)
+```
+
+
+```{r}
+#создаем функцию рекомендательной системы по Overview
+
+rec_overview = function(MOVID, number = 5) 
+{
+ movie = movies99
+ movid <- movie$id
+ idss <- dplyr::filter(movie, title == MOVID)
+ MOVID = idss$id
+ MOVID <- as.character(MOVID)
+  similar = head(sort(overview_cosine[,MOVID], decreasing = T), n = number)
+  s = which(overview_cosine[,MOVID] %in% similar, arr.ind = TRUE)
+  row = s %% dim(overview_cosine)[0:1]
+  final = rownames(overview_cosine)[row]
+  p <- movie %>% dplyr::filter(movid %in% final) %>% dplyr::select(title) %>% head(number, title)
+  rate = dplyr::select(based1, title, rating)
+  z = left_join(p, rate, by = "title")
+  z1 <- arrange(z, desc(rating))
+  z1
+  
+}
+
+```
+
+
+```{r}
+#тест рекомендации
+rec_overview("Back to the Future")
+
+```
+
+## Общий вид
+
+Мы попробовали создать модель общей системы
+
+## Примеры работы
+
+**1)Я новый пользователь, мне нравится фильм Трудности Перевода, какой будет аутпут?**
+
+```{r}
+rec_overview("Lost in Translation")
+```
+
+**2)Я новый пользователь, который отдает предпочтения комедиям, с рейтингом PG, длительность от часа до двух, какие фильмы будут мне рекомендованы?**
+
+```{r}
+rec_content("Comedy", "<=120", "PG-13")
+```
+
+**3)Что если у пользователя любимый фильм это малоизвестный Титаник(movieId = 2699), что ему предложат? Будет ли известный Титаник в рекомендации?**
+
+```{r}
+rec_overview("Titanic") #так как в таком запросе нельзя указать айди, а Титаника в датасете два, то они оба попадают в рекмоендацию
+```
+
+**4) Интересно посмотреть на работу системы, основанной на overview, поэтому пример для нее: если я выберу 11 друзей Оушена, будет ли мне рекомендовано что-то из этого: 48 часов, Крепкий орешек или Перевозчик**
+
+```{r}
+rec_overview("Ocean's Eleven") #Таких фильмов нет в наших данных, но есть вторая часть этого фильма и она как и ожидалась очень похожа на первую часть и стоит в начале списка.
+```
+
+**5) Хотел бы воспользоваться content-based системой, в которой мне понравилась возможность хорошего фильтра для фильмов. Хотел бы узнать результат для "Drama", ">70", "R"**
+
+```{r}
+rec_content("Drama", "<=120", "R")
+```
+
+**6) Пример для системы по overview. Если пользователь предпочитает фильмы "Мстители", "Человек-паук: Вдали от Дома" и "Доктор Стрэндж" будут ли ему рекомендованы подобные "супергеройские" фильмы или сиквелы этих фильмов (например, "Мстители: Финал" или ""Капитан Америка")?**
+
+Данных фильмов нет в базе, но теоретически должны рекомендоваться подобные фильмы. Единственное ограничение это если эти супергеройские фильмы не соответствуют “шаблону”. То Есть являются совершенно новым направлением. Например сериал “The Boys”, он относится к супергеройской тематике, но описывает супергероев не с лучшей стороны где суперы злоупотребляют славой и безнаказанностью. Данный фильм/сериал возможно будет рекомендоваться но ближе к концу списка. 
+
+**7) "Я новый пользователь и у меня есть следующие предпочтения: жанр - Drama, продолжительность - длинный,  16+"**
+
+```{r}
+rec_content("Drama", ">120", "R")
+```
+
+**8) Хочу проверить content-based систему, получу ли в рекомендации фильм Star Wars Return of Jedi, если введу жанр - Action, 150 минут и рейтинг - PG**
+
+```{r}
+rec_content("Action", ">120", "PG-13")
+#К сожалению, Звездных Войн нет. Но тут тоже высоко оцененные экшены. Звездные войны скорее выпали бы по запросу science fiction, жанр более располагает. А Титаник в рекомендации тот самый малоизвестный, это действительно экшен по жанру
+```
+
+**9) Меня нет в вашей системе (новый пользователь), мой любимый жанр - ужасы, длительность фильма ~ 1 час 40 минут, возрастное ограничение не указываю, какой будет ваша рекомендация?**
+
+```{r}
+rec_content("Horror", ">120", "")
+```
+
+## Оценка работы систем
+
+Оценим Content-Based систему. 
+Для ее оценки мы попросили у нескольких человек задать желаемые характеристики фильмов (жанр, длительность, возрастное ограничение) и выдали им рекомендацию используя нашу систему, затем попросили оценить полученный результат. 
+
+Как можно заметить, большинство опрошенных оценили рекомендацию положительно. Можно сделать вывод, что система работает неплохо.
+
+```{r}
+# создадим датафреймы с полученным оценками рекомендаций, а затем соберем все вместе
+
+user1 <- data.frame(c(101, 101, 101, 101),  
+                               c(40819, 51540, 46976, 44191),  
+                               c(5.0, 3.0, 4.0, 3.0),  
+                               c(1, 1, 1, 1))
+
+user2 <- data.frame(c(102, 102, 102, 102, 102),  
+                               c(8810, 6537, 7445	, 44555, 5481),  
+                               c(2.0, 5.0, 3.0, 4.0, 4.0),  
+                               c(1, 1, 1, 1, 1))
+
+user3 <- data.frame(c(103, 103, 103),  
+                               c(4369, 97938, 45722),  
+                               c(4.0, 2.0, 3.0),  
+                               c(1, 1, 1))
+
+user4 <- data.frame(c(104, 104, 104, 104),  
+                               c(4327, 8874, 5971, 2959),  
+                               c(5.0, 5.0, 4.0, 3.0),  
+                               c(1, 1, 1, 1))
+
+user5 <- data.frame(c(105, 105, 105),  
+                               c(5481, 7454, 6537),  
+                               c(5.0, 3.0, 5.0),  
+                               c(1, 1, 1))
+
+user6 <- data.frame(c(106, 106, 106, 106),  
+                               c(8810, 49530, 81847, 31658),  
+                               c(3.0, 4.0, 4.0, 5.0),  
+                               c(1, 1, 1, 1))
+
+user7 <- data.frame(c(107, 107, 107, 107),  
+                               c(47610, 94959, 46976, 58559),  
+                               c(4.0, 5.0, 2.0, 2.0),  
+                               c(1, 1, 1, 1))
+
+#задаем названия столбцов
+names(user1) <- c("userId", "movieId", "rating", "timestamp")  
+names(user2) <- c("userId", "movieId", "rating", "timestamp")  
+names(user3) <- c("userId", "movieId", "rating", "timestamp")  
+names(user4) <- c("userId", "movieId", "rating", "timestamp")  
+names(user5) <- c("userId", "movieId", "rating", "timestamp")  
+names(user6) <- c("userId", "movieId", "rating", "timestamp")  
+names(user7) <- c("userId", "movieId", "rating", "timestamp")  
+
+#собираем единый датафрейм
+ratings_users <- rbind(user1, user2, user3, user4, user5, user6, user7)
+
+#посмотрим на полученный результат с помощью гистограммы
+ggplot()+
+  geom_histogram(ratings_users, mapping = aes(x = rating, binwidth = 30))+
+  xlab("Оценка пользователей")+
+  ylab("Количество оценок")
+
+```
+
+# Q&A секция
+
+**1) А какие дополнительные данные вы использовали?**
+
+Мы использовали датасет с возрастными рейтингами фильмов.
+
+**2) Что делать, если пользователю не важна продолжительность фильма в методе content-based?**
+
+Пользователь может не указывать продолжительность фильма, система все равно выдаст ему рекомендацию на основе двух других параметров.
+
+**3) "Не предлагаем рандомные фильмы, так как можно не попасть в интересы пользователя" - Велик ли шанс не попасть в его интересы, еси предлагать топ фильмов по кол-ву высоких оценок?**
+
+Да, велик, потому что даже фильмы с самыми высокими оценками не покрывают все жанры. Например, в таком топе не будет хорроров. Кроме того, есть киноманы, которые наверняка видели большинство таких фильмов или же избирательные зрители, предпочитающие авторское кино.
+
+**4) Как именно с точки зрения кода реализуется коллаборативная система, основанная на overview? Каким образом там учитываются оценки уже существующих пользователей?**
+
+Данная система не является коллаборативной и предлагает фильмы исключительно на схожести описаний фильмов. Рейтинг в данном случае выводится исключительно для пользователя. Что бы он мог сам оценить стоит смотреть фильм или нет
+
+**5) Немного не понял, что значит в возникших проблемах "система не предполагает возвращения на шаг назад". Для чего это нужно и как бы улучшило работу системы.**
+
+Возврат на шаг назад позволил бы пользователю поменять предпочтительные характеристики фильмов, а не прогонять всю систему с самого начала.
+
+**6) Можно ли в оценку по overview ввести несколько названий фильмов для получения более точной рекомендации? И можно ли ввести несколько жанров в content-based систему? Если нет, то добавление этого могло бы помочь улучшить качество рекомендаций, поскольку у пользователя может не быть четких предпочтений в жанре и ему тогда нужно дать возможность выбрать несколько вариантов.**
+
+Ввести несколько названий или жанров не представляется возможным, к тому же если попытаться увеличить кол-во фильмов для owerview система может ничего не выдать так как пользователь(сам того не зная) введет абсолютно разные фильмы.
+
+**7) Какой метод построения коллаборативной фильтрации вы выбрали? IBCF или UBCF? И чем вы руководствовались?**
+
+Мы выбрали метод IBCF, потому что данный метод выводит рекомендацию, основываясь на схожести фильмов, что в данной ситуации кажется более показательным, нежели схожесть пользователей. Так как у людей могут быть разные вкусы, несмотря на некоторые общие любимые фильмы.
+
+**8)Что произойдет, если пользователя нет в системе и он вводит только один из трех инпутов?**
+
+Рекомендация все равно сработает, только теперь сортировка идет по одному импуту и значений фильмов может быть много.
+
+**9)В Content Based пользователь может указать только один жанр или есть возможность указать несколько?**
+
+Есть возможность указать только один жанр.
+
+**10)Как вы разделили длительность фильмов? Что будет видеть пользователь, когда ему нужно будет выбрать продолжительность фильма?**
+
+Мы разделили фильмы на 3 категории: менее 1.5 часов, менее 2 часов и более 2 часов. Пользователю предстоит указать желаемый интервал для рекомендации.
+
+**11) Мне показалось странным, что в рекомендациях, которые выпали для Star Wars появился фильм Asterix, при этом, он стоит на 1-м месте и выше, чем фильм Return of Jedi. С чем это может быть связано?**
+
+Нам тоже показалось это странным, но при детальном разборе и прочтении описания двух фильмов было выяснено что присутствуют такие слова как “Империя”/“Император”, В одном фильме это  галактическая, а в другом - римская империя. Или другой пример: “Сопротивление”, в одном случае имеются в виду повстанцы, а в другом деревня Астерикса.
+
+**12) Почему вы взяли длительность, жанр, рейтинг и популярность в регрессионный анализ? Проверялись ли остальные переменные? Если да, то почему их отсекли**
+
+Были взяты эти переменные исходя из субъективных суждений. Кроме того, другие возможные переменные имели неподходящий формат.
+
+**13) Проблема холодного старта, не вижу смысла брать в критерии продолжительность фильма, наверное имеет смысл только поделить фильмы на короткометражки и полнометражки, ведь обычно когда человек садится смотреть фильм он готов посидеть от полутора до 2 часов.**
+
+По нашему опыту не всегда человек готов сидеть от полутора до двух часов. Многие пользователи “заполняют” свободное время между работой и учебой или используют время в пути до работы/учебы/другого места назначения. Именно тогда возникает средний промежуток времени между короткометражками и полнометражками.
+
+**14) В системе content based - уверены ли вы во внедрении возрастного ограничения? Пользователь сам вводит его в инпуте?**
+
+Возрастное ограничение важно, чтобы пользователю не выпали фильмы, которые он не должен видеть исходя из своего возраста. Например, семья выбирает фильмы, который хочет посмотреть вместе с детьми. Для этого пользователь сам вводит данный параметр.
+
+**15) а если пользователь оценил все фильмы на сайте на 1-2 балла (нет хороших оценок), как система будет рекомендовать? если пользователь посмотрел совсем мало фильмов (1), для него актуальнее коллаборативная или content-based рекомендация?**
+
+Такому пользователю предпочтительнее выбрать Content-Based систему, потому что порекомендовать фильм, который ему бы понравился на основе оцененных на 1-2 -- невозможно. В Content-Based системе он уже сможет указать желаемые характеристики фильма.
+
+
+# Источники, которые мы использовали как примеры рекомендтальных систем
+
+1. https://meduza.io/cards/ne-mogu-pridumat-kakoy-film-posmotret-chto-delat
+2. https://www.netflix.com/ru/
+3. https://premier.one
+4. https://www.ivi.ru 
+5. https://okko.tv
+6. https://www.kinopoisk.ru
+
+
